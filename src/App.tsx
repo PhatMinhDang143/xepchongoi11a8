@@ -156,7 +156,7 @@ export default function App() {
       }
 
       const password = currentUser.student?.password || '';
-      const result = await apiAssignStudent(seatId, studentId, password);
+      const result = await apiAssignStudent(seatId, studentId, password, classroomState);
       
       if (result.success && result.data) {
         setClassroomState(result.data);
@@ -173,7 +173,7 @@ export default function App() {
 
     // Teacher mode:
     if (currentUser?.role === 'teacher') {
-      const result = await apiAdminAction('admin_assign', { seatId, studentId });
+      const result = await apiAdminAction('admin_assign', { seatId, studentId }, classroomState);
       if (result.success && result.data) {
         setClassroomState(result.data);
         const studentName = students.find((s) => s.id === studentId)?.name || 'Học sinh';
@@ -183,7 +183,7 @@ export default function App() {
         showToast(result.message, 'warn');
       }
     }
-  }, [classroomState.isLocked, currentUser, students]);
+  }, [classroomState, currentUser, students]);
 
   // Drop student handler
   const handleDropStudent = useCallback((seatId: string, studentId: string) => {
@@ -205,7 +205,7 @@ export default function App() {
       }
 
       const password = currentUser.student?.password || '';
-      const result = await apiUnassignStudent(studentId, password);
+      const result = await apiUnassignStudent(studentId, password, classroomState);
       if (result.success && result.data) {
         setClassroomState(result.data);
         showToast('Đã hủy chỗ ngồi của bạn', 'info');
@@ -217,13 +217,13 @@ export default function App() {
 
     // Teacher mode:
     if (currentUser?.role === 'teacher') {
-      const result = await apiAdminAction('admin_assign', { seatId, studentId: null });
+      const result = await apiAdminAction('admin_assign', { seatId, studentId: null }, classroomState);
       if (result.success && result.data) {
         setClassroomState(result.data);
         showToast('Đã làm trống ghế', 'info');
       }
     }
-  }, [classroomState.assignments, classroomState.isLocked, currentUser]);
+  }, [classroomState, currentUser]);
 
   // Unassign student by student ID
   const handleUnassignStudent = useCallback((studentId: string) => {
@@ -287,7 +287,7 @@ export default function App() {
   // Lock / Unlock toggle (teacher only)
   const handleToggleLock = async () => {
     if (currentUser?.role !== 'teacher') return;
-    const result = await apiAdminAction('toggle_lock');
+    const result = await apiAdminAction('toggle_lock', undefined, classroomState);
     if (result.success && result.data) {
       setClassroomState(result.data);
       showToast(
@@ -304,7 +304,7 @@ export default function App() {
       return;
     }
 
-    const result = await apiAdminAction('reset_assignments');
+    const result = await apiAdminAction('reset_assignments', undefined, classroomState);
     if (result.success && result.data) {
       setClassroomState(result.data);
       showToast('Đã xóa tất cả chỗ ngồi', 'info');
@@ -313,7 +313,7 @@ export default function App() {
 
   // Import state from JSON
   const handleImportState = async (newState: ClassroomState) => {
-    const result = await apiAdminAction('set_assignments', { assignments: newState.assignments });
+    const result = await apiAdminAction('set_assignments', { assignments: newState.assignments }, classroomState);
     if (result.success && result.data) {
       setClassroomState(result.data);
       showToast('Đã nạp sơ đồ chỗ ngồi thành công!', 'success');
