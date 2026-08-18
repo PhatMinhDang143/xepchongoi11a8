@@ -7,6 +7,13 @@ import {
   saveClassroomState, 
   generateShareUrl 
 } from './utils/storage';
+import { 
+  fetchServerClassroomState, 
+  subscribeToClassroomUpdates, 
+  apiAssignStudent, 
+  apiUnassignStudent, 
+  apiAdminAction 
+} from './utils/apiSync';
 import { LoginScreen } from './components/LoginScreen';
 import { Header } from './components/Header';
 import { Blackboard } from './components/Blackboard';
@@ -19,7 +26,8 @@ import {
   CheckCircle2, 
   AlertCircle, 
   Info,
-  UserCheck
+  Radio,
+  Wifi
 } from 'lucide-react';
 
 const USER_STORAGE_KEY = 'classroom_11a8_current_user';
@@ -27,6 +35,7 @@ const USER_STORAGE_KEY = 'classroom_11a8_current_user';
 export default function App() {
   const [classroomState, setClassroomState] = useState<ClassroomState>(() => getInitialClassroomState());
   const [students] = useState<Student[]>(INITIAL_STUDENTS_LIST);
+  const [isLiveConnected, setIsLiveConnected] = useState<boolean>(true);
   
   // Current user authentication state
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(() => {
@@ -61,10 +70,32 @@ export default function App() {
     setToast({ message, type });
     setTimeout(() => {
       setToast((prev) => (prev?.message === message ? null : prev));
-    }, 3000);
+    }, 3200);
   };
 
-  // Save to localStorage when assignments or lock changes
+  // Real-time synchronization with server across all devices
+  useEffect(() => {
+    // Initial fetch from server
+    fetchServerClassroomState().then((serverState) => {
+      if (serverState) {
+        setClassroomState(serverState);
+        saveClassroomState(serverState);
+      }
+    });
+
+    // Subscribe to live SSE updates
+    const unsubscribe = subscribeToClassroomUpdates((liveState) => {
+      setIsLiveConnected(true);
+      setClassroomState(liveState);
+      saveClassroomState(liveState);
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, []);
+
+  // Save to localStorage as secondary backup
   useEffect(() => {
     saveClassroomState(classroomState);
   }, [classroomState]);
@@ -110,9 +141,9 @@ export default function App() {
   };
 
   // Assign a student to a seat
-  const handleAssignStudent = useCallback((seatId: string, studentId: string) => {
+  const handleAssignStudent = useCallback(async (seatId: string, studentId: string) => {
     if (classroomState.isLocked) {
-      showToast('Sơ đồ đang bị khóa chỉnh sửa', 'warn');
+      showToast('Sơ đồ đang bị khóa chỉnh sửa bởi Giáo viên', 'warn');
       return;
     }
 
@@ -123,43 +154,35 @@ export default function App() {
         showToast('Bạn chỉ có thể chọn và điều chỉnh vị trí cho chính mình!', 'warn');
         return;
       }
+
+      const password = currentUser.student?.password || '';
+      const result = await apiAssignStudent(seatId, studentId, password);
+      
+      if (result.success && result.data) {
+        setClassroomState(result.data);
+        showToast(result.message, 'success');
+        triggerConfetti();
+      } else {
+        showToast(result.message || 'Không thể chọn chỗ ngồi này!', 'warn');
+        if (result.data) {
+          setClassroomState(result.data);
+        }
+      }
+      return;
     }
 
-    setClassroomState((prev) => {
-      const newAssignments = { ...prev.assignments };
-      
-      // Find if student was already in another seat, remove from old seat
-      const previousSeatId = Object.entries(newAssignments).find(
-        ([, sId]) => sId === studentId
-      )?.[0];
-      if (previousSeatId) {
-        delete newAssignments[previousSeatId];
+    // Teacher mode:
+    if (currentUser?.role === 'teacher') {
+      const result = await apiAdminAction('admin_assign', { seatId, studentId });
+      if (result.success && result.data) {
+        setClassroomState(result.data);
+        const studentName = students.find((s) => s.id === studentId)?.name || 'Học sinh';
+        showToast(`Đã xếp chỗ cho ${studentName}!`, 'success');
+        setSelectedStudentForPlacement(null);
+      } else {
+        showToast(result.message, 'warn');
       }
-
-      // If the target seat was occupied by another student and previous seat exists, swap (if teacher)
-      const currentOccupantId = newAssignments[seatId];
-      if (currentOccupantId && currentUser?.role === 'student') {
-        showToast('Ghế này đã có bạn khác chọn trước đó!', 'warn');
-        return prev;
-      }
-
-      if (currentOccupantId && previousSeatId && currentUser?.role === 'teacher') {
-        newAssignments[previousSeatId] = currentOccupantId;
-      }
-
-      newAssignments[seatId] = studentId;
-
-      const studentName = students.find((s) => s.id === studentId)?.name || 'Học sinh';
-      showToast(`Đã chọn chỗ cho ${studentName}!`, 'success');
-      triggerConfetti();
-      setSelectedStudentForPlacement(null);
-
-      return {
-        ...prev,
-        assignments: newAssignments,
-        lastUpdated: new Date().toISOString(),
-      };
-    });
+    }
   }, [classroomState.isLocked, currentUser, students]);
 
   // Drop student handler
@@ -168,33 +191,39 @@ export default function App() {
   }, [handleAssignStudent]);
 
   // Unassign seat
-  const handleUnassignSeat = useCallback((seatId: string) => {
+  const handleUnassignSeat = useCallback(async (seatId: string) => {
     if (classroomState.isLocked) return;
 
-    setClassroomState((prev) => {
-      const studentId = prev.assignments[seatId];
-      
-      // Check permission
-      if (currentUser?.role === 'student' && studentId !== currentUser.student?.id) {
+    const studentId = classroomState.assignments[seatId];
+    if (!studentId) return;
+
+    // Check permission
+    if (currentUser?.role === 'student') {
+      if (studentId !== currentUser.student?.id) {
         showToast('Bạn không thể xóa chỗ của bạn khác!', 'warn');
-        return prev;
+        return;
       }
 
-      const studentName = students.find((s) => s.id === studentId)?.name || '';
-      const newAssignments = { ...prev.assignments };
-      delete newAssignments[seatId];
-
-      if (studentName) {
-        showToast(`Đã làm trống chỗ của ${studentName}`, 'info');
+      const password = currentUser.student?.password || '';
+      const result = await apiUnassignStudent(studentId, password);
+      if (result.success && result.data) {
+        setClassroomState(result.data);
+        showToast('Đã hủy chỗ ngồi của bạn', 'info');
+      } else {
+        showToast(result.message, 'warn');
       }
+      return;
+    }
 
-      return {
-        ...prev,
-        assignments: newAssignments,
-        lastUpdated: new Date().toISOString(),
-      };
-    });
-  }, [classroomState.isLocked, currentUser, students]);
+    // Teacher mode:
+    if (currentUser?.role === 'teacher') {
+      const result = await apiAdminAction('admin_assign', { seatId, studentId: null });
+      if (result.success && result.data) {
+        setClassroomState(result.data);
+        showToast('Đã làm trống ghế', 'info');
+      }
+    }
+  }, [classroomState.assignments, classroomState.isLocked, currentUser]);
 
   // Unassign student by student ID
   const handleUnassignStudent = useCallback((studentId: string) => {
@@ -232,7 +261,7 @@ export default function App() {
         return;
       } else {
         const studentName = students.find((s) => s.id === occupiedBy)?.name || 'bạn khác';
-        showToast(`Ghế này đã có bạn ${studentName} ngồi!`, 'warn');
+        showToast(`Ghế này đã được bạn ${studentName} chọn!`, 'warn');
         return;
       }
     }
@@ -256,43 +285,42 @@ export default function App() {
   };
 
   // Lock / Unlock toggle (teacher only)
-  const handleToggleLock = () => {
+  const handleToggleLock = async () => {
     if (currentUser?.role !== 'teacher') return;
-    setClassroomState((prev) => {
-      const nextLocked = !prev.isLocked;
+    const result = await apiAdminAction('toggle_lock');
+    if (result.success && result.data) {
+      setClassroomState(result.data);
       showToast(
-        nextLocked ? 'Đã khóa sơ đồ lớp học' : 'Đã mở khóa sơ đồ để chọn chỗ',
-        nextLocked ? 'warn' : 'info'
+        result.data.isLocked ? 'Đã khóa sơ đồ lớp học' : 'Đã mở khóa sơ đồ để chọn chỗ',
+        result.data.isLocked ? 'warn' : 'info'
       );
-      return {
-        ...prev,
-        isLocked: nextLocked,
-      };
-    });
+    }
   };
 
   // Reset all assignments (teacher only)
-  const handleReset = () => {
+  const handleReset = async () => {
     if (currentUser?.role !== 'teacher' || classroomState.isLocked) return;
     if (!window.confirm('Bạn có chắc muốn xóa toàn bộ vị trí chỗ ngồi đã chọn không?')) {
       return;
     }
 
-    setClassroomState((prev) => ({
-      ...prev,
-      assignments: {},
-      lastUpdated: new Date().toISOString(),
-    }));
-    showToast('Đã xóa tất cả chỗ ngồi', 'info');
+    const result = await apiAdminAction('reset_assignments');
+    if (result.success && result.data) {
+      setClassroomState(result.data);
+      showToast('Đã xóa tất cả chỗ ngồi', 'info');
+    }
   };
 
   // Import state from JSON
-  const handleImportState = (newState: ClassroomState) => {
-    setClassroomState({
-      ...newState,
-      lastUpdated: new Date().toISOString(),
-    });
-    showToast('Đã nạp sơ đồ chỗ ngồi thành công!', 'success');
+  const handleImportState = async (newState: ClassroomState) => {
+    const result = await apiAdminAction('set_assignments', { assignments: newState.assignments });
+    if (result.success && result.data) {
+      setClassroomState(result.data);
+      showToast('Đã nạp sơ đồ chỗ ngồi thành công!', 'success');
+    } else {
+      setClassroomState(newState);
+      showToast('Đã nạp sơ đồ vào máy hiện tại', 'success');
+    }
   };
 
   // Copy share URL
@@ -355,6 +383,15 @@ export default function App() {
         onLogout={handleLogout}
       />
 
+      {/* Real-time Status Badge */}
+      <div className="bg-emerald-50 border-b border-emerald-200/60 py-1 px-3 text-center flex items-center justify-center gap-2 text-[11px] text-emerald-800 font-medium">
+        <span className="relative flex h-2 w-2">
+          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+          <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+        </span>
+        <span>Hệ thống đồng bộ trực tiếp thời gian thực (Real-time Live Sync) giữa 45 học sinh</span>
+      </div>
+
       {/* Main Content: 100% Fit for Mobile */}
       <main className="flex-1 w-full max-w-xl mx-auto px-2 sm:px-4 py-3 space-y-3">
         
@@ -407,7 +444,7 @@ export default function App() {
           isOpen={isSeatModalOpen}
           onClose={() => setIsSeatModalOpen(false)}
           seatId={activeModalSeatId}
-          targetStudent={targetModalStudent}
+          targetModalStudent={targetModalStudent}
           students={students}
           assignments={classroomState.assignments}
           onAssign={handleAssignStudent}
