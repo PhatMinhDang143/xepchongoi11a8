@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import confetti from 'canvas-confetti';
 import { ClassroomState, Student, CurrentUser } from './types';
-import { INITIAL_STUDENTS_LIST, CLASS_INFO } from './data/students';
+import { INITIAL_STUDENTS_LIST } from './data/students';
 import { 
   getInitialClassroomState, 
   saveClassroomState, 
@@ -26,14 +26,14 @@ import { Blackboard } from './components/Blackboard';
 import { ClassroomMap } from './components/ClassroomMap';
 import { StudentRoster } from './components/StudentRoster';
 import { SeatSelectionModal } from './components/SeatSelectionModal';
+import { StudentSeatConfirmModal } from './components/StudentSeatConfirmModal';
 import { ExportPrintModal } from './components/ExportPrintModal';
 import { GoogleSheetModal } from './components/GoogleSheetModal';
 import { 
   CheckCircle2, 
   AlertCircle, 
   Info,
-  FileSpreadsheet,
-  CloudCheck
+  FileSpreadsheet
 } from 'lucide-react';
 
 const USER_STORAGE_KEY = 'classroom_11a8_current_user';
@@ -61,6 +61,8 @@ export default function App() {
   const [activeModalSeatId, setActiveModalSeatId] = useState<string | null>(null);
   const [targetModalStudent, setTargetModalStudent] = useState<Student | null>(null);
   const [isSeatModalOpen, setIsSeatModalOpen] = useState(false);
+  const [isStudentConfirmModalOpen, setIsStudentConfirmModalOpen] = useState(false);
+  const [studentConfirmSeatId, setStudentConfirmSeatId] = useState<string | null>(null);
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
   const [isSheetModalOpen, setIsSheetModalOpen] = useState(false);
   
@@ -114,7 +116,6 @@ export default function App() {
         const sheetState = await fetchFromGoogleSheet(googleSheetUrl);
         if (sheetState && isMounted) {
           setClassroomState((prev) => {
-            // Only update if assignments or locked state actually changed
             const assignmentsChanged = JSON.stringify(prev.assignments) !== JSON.stringify(sheetState.assignments);
             const lockChanged = prev.isLocked !== sheetState.isLocked;
             if (assignmentsChanged || lockChanged) {
@@ -161,7 +162,7 @@ export default function App() {
     }
     
     if (user.role === 'student' && user.student) {
-      showToast(`Xin chào ${user.student.name}! Bạn hãy chọn 1 ghế trống.`, 'success');
+      showToast(`Xin chào ${user.student.name}! Bạn hãy bấm vào 1 ghế trống.`, 'success');
     } else {
       showToast('Đã đăng nhập quyền Giáo viên chủ nhiệm', 'success');
     }
@@ -181,8 +182,8 @@ export default function App() {
   const triggerConfetti = () => {
     try {
       confetti({
-        particleCount: 45,
-        spread: 60,
+        particleCount: 50,
+        spread: 70,
         origin: { y: 0.6 },
         colors: ['#10b981', '#3b82f6', '#f59e0b', '#8b5cf6'],
       });
@@ -191,14 +192,14 @@ export default function App() {
     }
   };
 
-  // Sync state helper to both Google Sheet and Server
-  const broadcastSync = useCallback(async (newState: ClassroomState) => {
+  // Sync state helper to both Google Sheet and Server in background
+  const broadcastSync = useCallback((newState: ClassroomState) => {
     if (googleSheetUrl) {
-      await saveToGoogleSheet(newState, googleSheetUrl);
+      saveToGoogleSheet(newState, googleSheetUrl).catch(() => {});
     }
   }, [googleSheetUrl]);
 
-  // Assign a student to a seat
+  // Assign student to seat (Optimistic 0ms Instant Update)
   const handleAssignStudent = useCallback(async (seatId: string, studentId: string) => {
     if (classroomState.isLocked) {
       showToast('Sơ đồ đang bị khóa chỉnh sửa bởi Giáo viên', 'warn');
@@ -213,35 +214,57 @@ export default function App() {
         return;
       }
 
-      const password = currentUser.student?.password || '';
-      const result = await apiAssignStudent(seatId, studentId, password, classroomState);
-      
-      if (result.success && result.data) {
-        setClassroomState(result.data);
-        broadcastSync(result.data);
-        showToast(result.message, 'success');
-        triggerConfetti();
-      } else {
-        showToast(result.message || 'Không thể chọn chỗ ngồi này!', 'warn');
-        if (result.data) {
-          setClassroomState(result.data);
-        }
+      // 1. OPTIMISTIC 0MS INSTANT LOCAL UI UPDATE
+      const newAssignments = { ...classroomState.assignments };
+      for (const [sId, studId] of Object.entries(newAssignments)) {
+        if (studId === studentId) delete newAssignments[sId];
       }
+      newAssignments[seatId] = studentId;
+
+      const optimisticState: ClassroomState = {
+        ...classroomState,
+        assignments: newAssignments,
+        lastUpdated: new Date().toISOString(),
+      };
+
+      setClassroomState(optimisticState);
+      saveClassroomState(optimisticState);
+      triggerConfetti();
+      showToast(`Đã chọn chỗ ngồi cho bạn ${currentUser.student?.name}!`, 'success');
+
+      // 2. BACKGROUND ASYNC SYNC (Google Sheet + Server)
+      broadcastSync(optimisticState);
+
+      const password = currentUser.student?.password || '';
+      apiAssignStudent(seatId, studentId, password, optimisticState).catch(() => {});
       return;
     }
 
     // Teacher mode:
     if (currentUser?.role === 'teacher') {
-      const result = await apiAdminAction('admin_assign', { seatId, studentId }, classroomState);
-      if (result.success && result.data) {
-        setClassroomState(result.data);
-        broadcastSync(result.data);
-        const studentName = students.find((s) => s.id === studentId)?.name || 'Học sinh';
-        showToast(`Đã xếp chỗ cho ${studentName}!`, 'success');
-        setSelectedStudentForPlacement(null);
-      } else {
-        showToast(result.message, 'warn');
+      const newAssignments = { ...classroomState.assignments };
+      if (studentId) {
+        for (const [sId, studId] of Object.entries(newAssignments)) {
+          if (studId === studentId) delete newAssignments[sId];
+        }
+        newAssignments[seatId] = studentId;
       }
+
+      const optimisticState: ClassroomState = {
+        ...classroomState,
+        assignments: newAssignments,
+        lastUpdated: new Date().toISOString(),
+      };
+
+      setClassroomState(optimisticState);
+      saveClassroomState(optimisticState);
+      broadcastSync(optimisticState);
+
+      const studentName = students.find((s) => s.id === studentId)?.name || 'Học sinh';
+      showToast(`Đã xếp chỗ cho ${studentName}!`, 'success');
+      setSelectedStudentForPlacement(null);
+
+      apiAdminAction('admin_assign', { seatId, studentId }, optimisticState).catch(() => {});
     }
   }, [classroomState, currentUser, students, broadcastSync]);
 
@@ -264,26 +287,43 @@ export default function App() {
         return;
       }
 
+      // Optimistic instant unassign
+      const newAssignments = { ...classroomState.assignments };
+      delete newAssignments[seatId];
+
+      const optimisticState: ClassroomState = {
+        ...classroomState,
+        assignments: newAssignments,
+        lastUpdated: new Date().toISOString(),
+      };
+
+      setClassroomState(optimisticState);
+      saveClassroomState(optimisticState);
+      broadcastSync(optimisticState);
+      showToast('Đã hủy chỗ ngồi của bạn', 'info');
+
       const password = currentUser.student?.password || '';
-      const result = await apiUnassignStudent(studentId, password, classroomState);
-      if (result.success && result.data) {
-        setClassroomState(result.data);
-        broadcastSync(result.data);
-        showToast('Đã hủy chỗ ngồi của bạn', 'info');
-      } else {
-        showToast(result.message, 'warn');
-      }
+      apiUnassignStudent(studentId, password, optimisticState).catch(() => {});
       return;
     }
 
     // Teacher mode:
     if (currentUser?.role === 'teacher') {
-      const result = await apiAdminAction('admin_assign', { seatId, studentId: null }, classroomState);
-      if (result.success && result.data) {
-        setClassroomState(result.data);
-        broadcastSync(result.data);
-        showToast('Đã làm trống ghế', 'info');
-      }
+      const newAssignments = { ...classroomState.assignments };
+      delete newAssignments[seatId];
+
+      const optimisticState: ClassroomState = {
+        ...classroomState,
+        assignments: newAssignments,
+        lastUpdated: new Date().toISOString(),
+      };
+
+      setClassroomState(optimisticState);
+      saveClassroomState(optimisticState);
+      broadcastSync(optimisticState);
+      showToast('Đã làm trống ghế', 'info');
+
+      apiAdminAction('admin_assign', { seatId, studentId: null }, optimisticState).catch(() => {});
     }
   }, [classroomState, currentUser, broadcastSync]);
 
@@ -309,22 +349,11 @@ export default function App() {
   const handleSelectSeat = (seatId: string) => {
     if (classroomState.isLocked) return;
     
-    // 1 tap selection for student
+    // For student: Open instant Confirmation Modal with clear seat information & big confirm button
     if (currentUser?.role === 'student' && currentUser.student) {
-      const occupiedBy = classroomState.assignments[seatId];
-      if (!occupiedBy) {
-        handleAssignStudent(seatId, currentUser.student.id);
-        return;
-      } else if (occupiedBy === currentUser.student.id) {
-        if (window.confirm('Bạn có muốn bỏ chọn vị trí chỗ ngồi này không?')) {
-          handleUnassignSeat(seatId);
-        }
-        return;
-      } else {
-        const studentName = students.find((s) => s.id === occupiedBy)?.name || 'bạn khác';
-        showToast(`Ghế này đã được bạn ${studentName} chọn!`, 'warn');
-        return;
-      }
+      setStudentConfirmSeatId(seatId);
+      setIsStudentConfirmModalOpen(true);
+      return;
     }
 
     // Teacher mode:
@@ -338,6 +367,18 @@ export default function App() {
     setIsSeatModalOpen(true);
   };
 
+  // Student confirmed seat selection from modal
+  const handleStudentConfirmModalAssign = async (seatId: string) => {
+    if (currentUser?.role === 'student' && currentUser.student) {
+      await handleAssignStudent(seatId, currentUser.student.id);
+    }
+  };
+
+  // Student confirmed unassign from modal
+  const handleStudentConfirmModalUnassign = async (seatId: string) => {
+    await handleUnassignSeat(seatId);
+  };
+
   // Click on student roster to assign (teacher only)
   const handleSelectStudentToSeat = (student: Student) => {
     if (classroomState.isLocked) return;
@@ -348,15 +389,19 @@ export default function App() {
   // Lock / Unlock toggle (teacher only)
   const handleToggleLock = async () => {
     if (currentUser?.role !== 'teacher') return;
-    const result = await apiAdminAction('toggle_lock', undefined, classroomState);
-    if (result.success && result.data) {
-      setClassroomState(result.data);
-      broadcastSync(result.data);
-      showToast(
-        result.data.isLocked ? 'Đã khóa sơ đồ lớp học' : 'Đã mở khóa sơ đồ để chọn chỗ',
-        result.data.isLocked ? 'warn' : 'info'
-      );
-    }
+    const optimisticState: ClassroomState = {
+      ...classroomState,
+      isLocked: !classroomState.isLocked,
+      lastUpdated: new Date().toISOString(),
+    };
+    setClassroomState(optimisticState);
+    saveClassroomState(optimisticState);
+    broadcastSync(optimisticState);
+    showToast(
+      optimisticState.isLocked ? 'Đã khóa sơ đồ lớp học' : 'Đã mở khóa sơ đồ để chọn chỗ',
+      optimisticState.isLocked ? 'warn' : 'info'
+    );
+    apiAdminAction('toggle_lock', undefined, optimisticState).catch(() => {});
   };
 
   // Reset all assignments (teacher only)
@@ -366,29 +411,28 @@ export default function App() {
       return;
     }
 
-    const result = await apiAdminAction('reset_assignments', undefined, classroomState);
-    if (result.success && result.data) {
-      setClassroomState(result.data);
-      broadcastSync(result.data);
-      showToast('Đã xóa tất cả chỗ ngồi', 'info');
-    }
+    const optimisticState: ClassroomState = {
+      ...classroomState,
+      assignments: {},
+      lastUpdated: new Date().toISOString(),
+    };
+    setClassroomState(optimisticState);
+    saveClassroomState(optimisticState);
+    broadcastSync(optimisticState);
+    showToast('Đã xóa tất cả chỗ ngồi', 'info');
+    apiAdminAction('reset_assignments', undefined, optimisticState).catch(() => {});
   };
 
   // Import state from JSON
   const handleImportState = async (newState: ClassroomState) => {
-    const result = await apiAdminAction('set_assignments', { assignments: newState.assignments }, classroomState);
-    if (result.success && result.data) {
-      setClassroomState(result.data);
-      broadcastSync(result.data);
-      showToast('Đã nạp sơ đồ chỗ ngồi thành công!', 'success');
-    } else {
-      setClassroomState(newState);
-      broadcastSync(newState);
-      showToast('Đã nạp sơ đồ vào máy hiện tại', 'success');
-    }
+    setClassroomState(newState);
+    saveClassroomState(newState);
+    broadcastSync(newState);
+    showToast('Đã nạp sơ đồ chỗ ngồi thành công!', 'success');
+    apiAdminAction('set_assignments', { assignments: newState.assignments }, newState).catch(() => {});
   };
 
-  // Copy share URL (includes sheet_api parameter so all students automatically connect)
+  // Copy share URL
   const handleShare = () => {
     let url = window.location.origin + window.location.pathname;
     if (googleSheetUrl) {
@@ -458,7 +502,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Header - Cleaned up for student view */}
+      {/* Header */}
       <Header
         className={classroomState.className}
         teacherName={classroomState.teacherName}
@@ -476,23 +520,25 @@ export default function App() {
         onLogout={handleLogout}
       />
 
-      {/* Database Connection Status Banner */}
-      <div className="bg-emerald-50 border-b border-emerald-200/60 py-1 px-3 text-center flex items-center justify-center gap-2 text-[11px] text-emerald-800 font-medium">
-        {isSheetConnected ? (
-          <>
-            <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-            <span>Đang đồng bộ trực tuyến với <strong>Google Sheet Database</strong> (2 máy khác nhau đều lưu)</span>
-          </>
-        ) : (
-          <>
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-            </span>
-            <span>Hệ thống đồng bộ trực tiếp thời gian thực giữa 45 học sinh</span>
-          </>
-        )}
-      </div>
+      {/* Database Connection Status Banner (Teacher mode only) */}
+      {currentUser?.role === 'teacher' && (
+        <div className="bg-emerald-50 border-b border-emerald-200/60 py-1 px-3 text-center flex items-center justify-center gap-2 text-[11px] text-emerald-800 font-medium">
+          {isSheetConnected ? (
+            <>
+              <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+              <span>Đang đồng bộ trực tuyến với <strong>Google Sheet Database</strong></span>
+            </>
+          ) : (
+            <>
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+              </span>
+              <span>Hệ thống đồng bộ trực tiếp thời gian thực</span>
+            </>
+          )}
+        </div>
+      )}
 
       {/* Main Content: 100% Fit for Mobile */}
       <main className="flex-1 w-full max-w-xl mx-auto px-2 sm:px-4 py-3 space-y-3">
@@ -504,7 +550,7 @@ export default function App() {
           schoolYear={classroomState.schoolYear}
         />
 
-        {/* Classroom Desks Map (No horizontal scroll, 100% responsive, straight 4 seats per table) */}
+        {/* Classroom Desks Map */}
         <ClassroomMap
           state={classroomState}
           students={students}
@@ -540,7 +586,22 @@ export default function App() {
         </div>
       </footer>
 
-      {/* Modals (Teacher mode only) */}
+      {/* Student Seat Confirmation Modal (Fast, clear & 0ms delay) */}
+      <StudentSeatConfirmModal
+        isOpen={isStudentConfirmModalOpen}
+        onClose={() => {
+          setIsStudentConfirmModalOpen(false);
+          setStudentConfirmSeatId(null);
+        }}
+        seatId={studentConfirmSeatId}
+        currentUser={currentUser}
+        students={students}
+        assignments={classroomState.assignments}
+        onConfirmAssign={handleStudentConfirmModalAssign}
+        onConfirmUnassign={handleStudentConfirmModalUnassign}
+      />
+
+      {/* Teacher Modals */}
       {currentUser?.role === 'teacher' && (
         <>
           <SeatSelectionModal
