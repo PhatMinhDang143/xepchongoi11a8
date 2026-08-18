@@ -1,0 +1,6 @@
+{
+  "name": "Sơ Đồ Chỗ Ngồi Lớp 11A8",
+  "description": "Ứng dụng sơ đồ chỗ ngồi trực tuyến cho học sinh Lớp 11A8 tự chọn chỗ ngồi kéo thả trực quan - GVCN Đặng Minh Phát (2026-2027)",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+@media print {
+  body {
+    background-color: white !important;
+    color: black !important;
+  }
+  header, footer, #btn-share, #btn-export, #btn-github-sync, #btn-perspective, #btn-lock-toggle, #btn-random-shuffle, #btn-reset, .lg\:sticky {
+    display: none !important;
+  }
+  .overflow-x-auto {
+    overflow: visible !important;
+  }
+  @page {
+    size: A4 landscape;
+    margin: 1cm;
+  }
+}
